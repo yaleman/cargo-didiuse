@@ -1,3 +1,4 @@
+use glob::glob;
 use proc_macro2::LineColumn;
 use rustsec::{Database, Lockfile};
 use serde::Deserialize;
@@ -16,6 +17,7 @@ use walkdir::WalkDir;
 
 const SOURCE_DIRS: [&str; 4] = ["src", "tests", "examples", "benches"];
 const ADVISORY_DB_DIRECTORY: &str = "advisory-db";
+const CARGO_MANIFEST_FILE: &str = "Cargo.toml";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalysisResult {
@@ -106,6 +108,34 @@ pub enum AnalyzeError {
         #[source]
         source: syn::Error,
     },
+
+    #[error("failed to read Cargo manifest {path}: {source}")]
+    ReadManifest {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse Cargo manifest {path}: {source}")]
+    ParseManifest {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("failed to parse workspace member pattern {pattern}: {source}")]
+    ParseWorkspaceMemberPattern {
+        pattern: String,
+        #[source]
+        source: glob::PatternError,
+    },
+
+    #[error("failed to expand workspace member pattern {pattern}: {source}")]
+    ExpandWorkspaceMemberPattern {
+        pattern: String,
+        #[source]
+        source: glob::GlobError,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +162,18 @@ struct OsvEcosystemSpecific {
 struct OsvAffects {
     #[serde(default)]
     functions: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CargoManifest {
+    #[serde(default)]
+    workspace: Option<CargoWorkspaceManifest>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CargoWorkspaceManifest {
+    #[serde(default)]
+    members: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -540,31 +582,100 @@ fn resolve_imported_paths(
 fn discover_source_files(consuming_crate_root: &Path) -> Result<Vec<PathBuf>, AnalyzeError> {
     let mut files = Vec::new();
 
-    for directory in SOURCE_DIRS {
-        let source_dir = consuming_crate_root.join(directory);
-        if !source_dir.is_dir() {
-            continue;
-        }
+    for scan_root in discover_scan_roots(consuming_crate_root)? {
+        for directory in SOURCE_DIRS {
+            let source_dir = scan_root.join(directory);
+            if !source_dir.is_dir() {
+                continue;
+            }
 
-        for entry in WalkDir::new(&source_dir) {
-            let entry = entry.map_err(|source| AnalyzeError::WalkSource {
-                path: source_dir.clone(),
-                source,
-            })?;
+            for entry in WalkDir::new(&source_dir) {
+                let entry = entry.map_err(|source| AnalyzeError::WalkSource {
+                    path: source_dir.clone(),
+                    source,
+                })?;
 
-            if entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "rs")
-            {
-                files.push(entry.into_path());
+                if entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "rs")
+                {
+                    files.push(entry.into_path());
+                }
             }
         }
     }
 
     files.sort();
+    files.dedup();
     Ok(files)
+}
+
+fn discover_scan_roots(consuming_crate_root: &Path) -> Result<Vec<PathBuf>, AnalyzeError> {
+    let manifest_path = consuming_crate_root.join(CARGO_MANIFEST_FILE);
+    let mut roots = vec![consuming_crate_root.to_path_buf()];
+    if !manifest_path.is_file() {
+        return Ok(roots);
+    }
+
+    let manifest_contents =
+        fs::read_to_string(&manifest_path).map_err(|source| AnalyzeError::ReadManifest {
+            path: manifest_path.clone(),
+            source,
+        })?;
+    let manifest: CargoManifest =
+        toml::from_str(&manifest_contents).map_err(|source| AnalyzeError::ParseManifest {
+            path: manifest_path,
+            source,
+        })?;
+
+    let Some(workspace) = manifest.workspace else {
+        return Ok(roots);
+    };
+
+    for member in workspace.members {
+        let mut member_roots = expand_workspace_member(consuming_crate_root, &member)?;
+        roots.append(&mut member_roots);
+    }
+
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn expand_workspace_member(
+    workspace_root: &Path,
+    member: &str,
+) -> Result<Vec<PathBuf>, AnalyzeError> {
+    let candidate = workspace_root.join(member);
+    if !member.contains('*') && !member.contains('?') && !member.contains('[') {
+        if candidate.is_dir() {
+            return Ok(vec![candidate]);
+        }
+        return Ok(Vec::new());
+    }
+
+    let pattern = candidate.to_string_lossy().into_owned();
+    let member_paths =
+        glob(&pattern).map_err(|source| AnalyzeError::ParseWorkspaceMemberPattern {
+            pattern: pattern.clone(),
+            source,
+        })?;
+
+    let mut expanded = Vec::new();
+    for member_path in member_paths {
+        let member_path =
+            member_path.map_err(|source| AnalyzeError::ExpandWorkspaceMemberPattern {
+                pattern: pattern.clone(),
+                source,
+            })?;
+        if member_path.is_dir() {
+            expanded.push(member_path);
+        }
+    }
+
+    Ok(expanded)
 }
 
 fn extract_target_functions(report: &OsvReport) -> Vec<String> {

@@ -5,3 +5,4 @@ target/
 .env
 .envrc
 *.asc
+tarpaulin-report.html

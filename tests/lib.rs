@@ -204,6 +204,33 @@ fn integration_myterriblecode_sample_detects_expected_calls() {
 }
 
 #[test]
+fn integration_workspace_layout_detects_member_crate_usage() {
+    let report_path = PathBuf::from(&format!(
+        "{}/test_data/vuln_report.json",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let workspace_root = PathBuf::from(&format!(
+        "{}/test_data/workspace_layout",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+
+    let result = analyze_report_against_crate(&report_path, &workspace_root)
+        .expect("analysis should succeed for workspace root integration sample");
+
+    let workspace_member_source = Path::new("crates")
+        .join("consumer")
+        .join("src")
+        .join("lib.rs");
+
+    assert!(result.vulnerable_used);
+    assert!(result.findings.iter().any(|finding| {
+        finding.file.ends_with(&workspace_member_source)
+            && finding.match_kind == MatchKind::DirectPathCall
+            && finding.vulnerable_function == "vulnerablepackage::ExampleStruct::broken"
+    }));
+}
+
+#[test]
 fn loads_targets_from_advisory_db_and_detects_usage() {
     let temp_dir = TempDir::new().expect("failed to create temporary test directory");
     let crate_root = temp_dir.path().join("consumer");

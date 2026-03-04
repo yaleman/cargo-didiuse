@@ -1,0 +1,30 @@
+[env]
+# Use the project name derived from the current directory
+# MISE_DISABLE_TOOLS = 1
+PROJECT_NAME = "{{ config_root | basename }}"
+
+[tasks.check]
+description = "Run rust checks"
+depends = ['fmt', 'clippy', 'test']
+
+[tasks.fmt]
+description = "Check rust code formatting"
+run = ["cargo fmt --all --check || true", "cargo fmt --all "]
+
+[tasks.test]
+description = "Run rust tests"
+depends = ["fmt"]
+run = "cargo test --quiet --all-features --all-targets --workspace"
+
+[tasks.coverage]
+description = "Run code coverage"
+run = '''
+cargo tarpaulin \
+  --all-features --all-targets --exclude-files 'tests/*' \
+  --exclude-files '**/src/main.rs' --out Html
+'''
+
+[tasks.clippy]
+description = "Run an aggressive clippy"
+depends = ["fmt"]
+run = "cargo clippy --all-targets --all-features --quiet"
