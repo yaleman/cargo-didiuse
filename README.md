@@ -17,6 +17,8 @@ It can read an OSV/RustSec-style report or scan the local RustSec advisory datab
   - alias-resolved calls via `use`
   - heuristic method calls when a receiver type matches a known vulnerable type
 
+Findings are reported as de-duplicated and sorted output.
+
 > Note: this tool tries hard, but it is not perfect. It is a best-effort static detector and can have false positives or miss some call patterns.
 
 ## Install / build
@@ -70,6 +72,12 @@ cargo-didiuse --vuln-json path/to/vuln_report.json
 - `0`: no vulnerable usages found
 - `1`: vulnerable usages found
 - `2`: analysis error (invalid path, parse failures, missing advisory data, etc.)
+
+When matches are found, each line is printed as:
+
+```
+path:line:column [match-kind] matched_call -> vulnerable_function
+```
 
 ## Notes
 
