@@ -12,12 +12,15 @@ use syn::{
     spanned::Spanned,
     visit::{self, Visit},
 };
-use thiserror::Error;
 use walkdir::WalkDir;
+
+pub mod errors;
+use errors::AnalyzeError;
 
 const SOURCE_DIRS: [&str; 4] = ["src", "tests", "examples", "benches"];
 const ADVISORY_DB_DIRECTORY: &str = "advisory-db";
 const CARGO_MANIFEST_FILE: &str = "Cargo.toml";
+const MAX_ALIAS_RESOLUTION_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalysisResult {
@@ -41,101 +44,6 @@ pub enum MatchKind {
     DirectPathCall,
     AliasResolvedCall,
     HeuristicMethodCall,
-}
-
-#[derive(Debug, Error)]
-pub enum AnalyzeError {
-    #[error("consuming crate root does not exist: {path}")]
-    MissingCrateRoot { path: PathBuf },
-
-    #[error("failed to read report file {path}: {source}")]
-    ReadReport {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse report JSON {path}: {source}")]
-    ParseReport {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-
-    #[error("failed to locate Cargo home directory: {source}")]
-    LocateCargoHome {
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("advisory database directory does not exist: {path}")]
-    MissingAdvisoryDatabase { path: PathBuf },
-
-    #[error("Cargo.lock does not exist: {path}")]
-    MissingLockfile { path: PathBuf },
-
-    #[error("failed to open advisory database {path}: {source}")]
-    OpenAdvisoryDatabase {
-        path: PathBuf,
-        #[source]
-        source: rustsec::Error,
-    },
-
-    #[error("failed to read Cargo.lock {path}: {source}")]
-    LoadLockfile {
-        path: PathBuf,
-        #[source]
-        source: rustsec::cargo_lock::Error,
-    },
-
-    #[error("failed to walk source directory {path}: {source}")]
-    WalkSource {
-        path: PathBuf,
-        #[source]
-        source: walkdir::Error,
-    },
-
-    #[error("failed to read Rust source file {path}: {source}")]
-    ReadSource {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse Rust source file {path}: {source}")]
-    ParseSource {
-        path: PathBuf,
-        #[source]
-        source: syn::Error,
-    },
-
-    #[error("failed to read Cargo manifest {path}: {source}")]
-    ReadManifest {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to parse Cargo manifest {path}: {source}")]
-    ParseManifest {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-
-    #[error("failed to parse workspace member pattern {pattern}: {source}")]
-    ParseWorkspaceMemberPattern {
-        pattern: String,
-        #[source]
-        source: glob::PatternError,
-    },
-
-    #[error("failed to expand workspace member pattern {pattern}: {source}")]
-    ExpandWorkspaceMemberPattern {
-        pattern: String,
-        #[source]
-        source: glob::GlobError,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -778,7 +686,10 @@ fn collect_use_tree(
                 collect_use_tree(prefix, nested_tree, alias_map, imported_paths);
             }
         }
-        UseTree::Glob(_) => {}
+        UseTree::Glob(_) => {
+
+            // TODO if it's a glob match then we've probably imported it, we should track glob imports and treat them as potential matches for method calls.
+        }
     }
 }
 
@@ -807,7 +718,7 @@ fn canonicalize_path(path: &str, alias_map: &BTreeMap<String, String>) -> (Strin
     let mut normalized = normalize_function_path(path).unwrap_or_default();
     let mut alias_used = false;
 
-    for _ in 0..8 {
+    for _ in 0..MAX_ALIAS_RESOLUTION_DEPTH {
         let Some(first_segment) = normalized.split("::").next() else {
             break;
         };
