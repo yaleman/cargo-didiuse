@@ -75,7 +75,7 @@ cargo-didiuse --vuln-json path/to/vuln_report.json
 
 When matches are found, each line is printed as:
 
-```
+```text
 path:line:column [match-kind] matched_call -> vulnerable_function
 ```
 
