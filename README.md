@@ -7,9 +7,10 @@ It can read an OSV/RustSec-style report or scan the local RustSec advisory datab
 ## What it does
 
 - Detects potentially vulnerable function usage in source files by parsing Rust syntax (AST) with `syn`.
-- Supports two input sources:
+- Supports three input sources:
   - A vulnerability JSON report (`--vuln-json`)
   - The RustSec advisory DB (default: `$CARGO_HOME/advisory-db`, override with `--advisory-db`)
+  - Explicit function target glob patterns (`--glob`)
 - Resolves and checks workspace members declared in `Cargo.toml`.
 - Scans common Rust source directories (`src`, `tests`, `examples`, `benches`).
 - Reports matches as:
@@ -43,6 +44,18 @@ Run against a report file:
 cargo run -- --vuln-json path/to/vuln_report.json
 ```
 
+Run against explicit function globs:
+
+```bash
+cargo run -- --glob 'vuln2::ExampleStruct::broken'
+```
+
+Use wildcards:
+
+```bash
+cargo run -- --glob 'vuln2::ExampleStruct::*' --glob 'vuln2::*'
+```
+
 Run against the advisory DB for the current crate:
 
 ```bash
@@ -64,6 +77,7 @@ cargo-didiuse --vuln-json path/to/vuln_report.json
 ## CLI options
 
 - `-p, --package-path <PATH>`: crate/workspace root (default `.`)
+- `--glob <PATTERN>`: vulnerable target glob pattern (repeatable). When provided, `--glob` takes precedence over `--vuln-json` and `--advisory-db`
 - `-v, --vuln-json <PATH>`: path to an OSV/RustSec JSON report
 - `--advisory-db <PATH>`: path to advisory DB directory (when not using `--vuln-json`)
 

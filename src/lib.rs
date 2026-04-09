@@ -1,4 +1,4 @@
-use glob::glob;
+use glob::{Pattern, glob};
 use proc_macro2::LineColumn;
 use rustsec::{Database, Lockfile};
 use serde::Deserialize;
@@ -21,6 +21,12 @@ const SOURCE_DIRS: [&str; 4] = ["src", "tests", "examples", "benches"];
 const ADVISORY_DB_DIRECTORY: &str = "advisory-db";
 const CARGO_MANIFEST_FILE: &str = "Cargo.toml";
 const MAX_ALIAS_RESOLUTION_DEPTH: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetInputMode {
+    Exact,
+    Glob,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalysisResult {
@@ -84,13 +90,7 @@ struct CargoWorkspaceManifest {
     members: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-struct MethodTarget {
-    vulnerable_function: String,
-    type_path: String,
-}
-
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct UseCollector {
     alias_map: BTreeMap<String, String>,
     imported_paths: BTreeSet<String>,
@@ -130,8 +130,7 @@ impl<'ast> Visit<'ast> for PublicUseCollector {
 
 struct Detector {
     file: PathBuf,
-    vulnerable_functions: BTreeSet<String>,
-    method_targets_by_name: BTreeMap<String, Vec<MethodTarget>>,
+    target_matchers: Vec<TargetMatcher>,
     alias_map: BTreeMap<String, String>,
     imported_paths: BTreeSet<String>,
     typed_bindings: BTreeMap<String, String>,
@@ -139,18 +138,22 @@ struct Detector {
     findings: Vec<Finding>,
 }
 
+#[derive(Clone, Debug)]
+struct TargetMatcher {
+    target: String,
+    pattern: Pattern,
+}
+
 impl Detector {
     fn new(
         file: PathBuf,
-        vulnerable_functions: BTreeSet<String>,
-        method_targets_by_name: BTreeMap<String, Vec<MethodTarget>>,
+        target_matchers: Vec<TargetMatcher>,
         alias_map: BTreeMap<String, String>,
         imported_paths: BTreeSet<String>,
     ) -> Self {
         Self {
             file,
-            vulnerable_functions,
-            method_targets_by_name,
+            target_matchers,
             alias_map,
             imported_paths,
             typed_bindings: BTreeMap::new(),
@@ -174,7 +177,7 @@ impl Detector {
         }
     }
 
-    fn receiver_matches_typed_target(&self, receiver: &Expr, type_path: &str) -> bool {
+    fn receiver_bound_type(&self, receiver: &Expr) -> Option<&str> {
         if let Expr::Path(expr_path) = receiver
             && expr_path.path.segments.len() == 1
             && expr_path.path.leading_colon.is_none()
@@ -182,13 +185,32 @@ impl Detector {
             && let Some(segment) = expr_path.path.segments.first()
         {
             let binding = segment.ident.to_string();
-            return self
-                .typed_bindings
-                .get(&binding)
-                .is_some_and(|bound_type| bound_type == type_path);
+            return self.typed_bindings.get(&binding).map(String::as_str);
         }
 
-        false
+        None
+    }
+
+    fn first_match_index(&self, path: &str) -> Option<usize> {
+        self.target_matchers
+            .iter()
+            .position(|matcher| matcher.pattern.matches(path))
+    }
+
+    fn target_for_index(&self, index: usize) -> &str {
+        self.target_matchers[index].target.as_str()
+    }
+
+    fn best_match_for_candidates(&self, candidates: &BTreeSet<String>) -> Option<usize> {
+        let mut best_match_index = None;
+        for candidate in candidates {
+            if let Some(candidate_match_index) = self.first_match_index(candidate)
+                && best_match_index.is_none_or(|current| candidate_match_index < current)
+            {
+                best_match_index = Some(candidate_match_index);
+            }
+        }
+        best_match_index
     }
 }
 
@@ -210,7 +232,8 @@ impl<'ast> Visit<'ast> for Detector {
             && let Some(raw_path) = path_to_string(&expr_path.path)
         {
             let (canonical, alias_used) = canonicalize_path(&raw_path, &self.alias_map);
-            if self.vulnerable_functions.contains(&canonical) {
+            if let Some(match_index) = self.first_match_index(&canonical) {
+                let target = self.target_for_index(match_index).to_owned();
                 let (line, column) = line_column(node.func.span().start());
                 let matched_call = if alias_used {
                     raw_path.clone()
@@ -218,7 +241,7 @@ impl<'ast> Visit<'ast> for Detector {
                     canonical.clone()
                 };
                 self.record_finding(Finding {
-                    vulnerable_function: canonical,
+                    vulnerable_function: target,
                     file: self.file.clone(),
                     line,
                     column,
@@ -237,23 +260,27 @@ impl<'ast> Visit<'ast> for Detector {
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method_name = node.method.to_string();
-        if let Some(targets) = self.method_targets_by_name.get(&method_name).cloned() {
-            for target in targets {
-                let strong = self.receiver_matches_typed_target(&node.receiver, &target.type_path);
-                let fallback = self.imported_paths.contains(&target.type_path);
-                if strong || fallback {
-                    let (line, column) = line_column(node.span().start());
-                    let receiver = simple_receiver_name(&node.receiver);
-                    self.record_finding(Finding {
-                        vulnerable_function: target.vulnerable_function,
-                        file: self.file.clone(),
-                        line,
-                        column,
-                        match_kind: MatchKind::HeuristicMethodCall,
-                        matched_call: format!("{receiver}.{method_name}()"),
-                    });
-                }
-            }
+        let mut candidate_paths = BTreeSet::new();
+
+        if let Some(bound_type) = self.receiver_bound_type(&node.receiver) {
+            candidate_paths.insert(format!("{bound_type}::{method_name}"));
+        }
+
+        for imported_path in &self.imported_paths {
+            candidate_paths.insert(format!("{imported_path}::{method_name}"));
+        }
+
+        if let Some(match_index) = self.best_match_for_candidates(&candidate_paths) {
+            let (line, column) = line_column(node.span().start());
+            let receiver = simple_receiver_name(&node.receiver);
+            self.record_finding(Finding {
+                vulnerable_function: self.target_for_index(match_index).to_owned(),
+                file: self.file.clone(),
+                line,
+                column,
+                match_kind: MatchKind::HeuristicMethodCall,
+                matched_call: format!("{receiver}.{method_name}()"),
+            });
         }
 
         visit::visit_expr_method_call(self, node);
@@ -282,7 +309,35 @@ pub fn analyze_report_against_crate(
         })?;
 
     let target_functions = extract_target_functions(&report);
-    let findings = analyze_crate_sources(consuming_crate_root, &target_functions)?;
+    let findings = analyze_crate_sources(
+        consuming_crate_root,
+        &target_functions,
+        TargetInputMode::Exact,
+    )?;
+
+    Ok(AnalysisResult {
+        vulnerable_used: !findings.is_empty(),
+        target_functions,
+        findings,
+    })
+}
+
+pub fn analyze_globs_against_crate(
+    globs: &[String],
+    consuming_crate_root: &Path,
+) -> Result<AnalysisResult, AnalyzeError> {
+    if !consuming_crate_root.is_dir() {
+        return Err(AnalyzeError::MissingCrateRoot {
+            path: consuming_crate_root.to_path_buf(),
+        });
+    }
+
+    let target_functions = normalize_glob_targets(globs)?;
+    let findings = analyze_crate_sources(
+        consuming_crate_root,
+        &target_functions,
+        TargetInputMode::Glob,
+    )?;
 
     Ok(AnalysisResult {
         vulnerable_used: !findings.is_empty(),
@@ -309,7 +364,11 @@ pub fn analyze_advisory_db_against_crate(
 
     let target_functions =
         extract_target_functions_from_advisory_db(&advisory_db_path, &lockfile_path)?;
-    let findings = analyze_crate_sources(consuming_crate_root, &target_functions)?;
+    let findings = analyze_crate_sources(
+        consuming_crate_root,
+        &target_functions,
+        TargetInputMode::Exact,
+    )?;
 
     Ok(AnalysisResult {
         vulnerable_used: !findings.is_empty(),
@@ -321,21 +380,17 @@ pub fn analyze_advisory_db_against_crate(
 fn analyze_crate_sources(
     consuming_crate_root: &Path,
     target_functions: &[String],
+    target_mode: TargetInputMode,
 ) -> Result<Vec<Finding>, AnalyzeError> {
-    let vulnerable_functions: BTreeSet<String> = target_functions.iter().cloned().collect();
-    let method_targets_by_name = build_method_targets(&vulnerable_functions);
+    let target_matchers = build_target_matchers(target_functions, target_mode)?;
     let source_files = discover_source_files(consuming_crate_root)?;
     let public_aliases = discover_public_aliases(&source_files)?;
 
     let mut findings = Vec::new();
 
     for source_file in source_files {
-        let mut file_findings = analyze_source_file(
-            &source_file,
-            &vulnerable_functions,
-            &method_targets_by_name,
-            &public_aliases,
-        )?;
+        let mut file_findings =
+            analyze_source_file(&source_file, &target_matchers, &public_aliases)?;
         findings.append(&mut file_findings);
     }
 
@@ -360,6 +415,51 @@ fn analyze_crate_sources(
     findings.dedup_by(|a, b| a == b);
 
     Ok(findings)
+}
+
+fn normalize_glob_targets(globs: &[String]) -> Result<Vec<String>, AnalyzeError> {
+    if globs.is_empty() {
+        return Err(AnalyzeError::MissingGlobPatterns);
+    }
+
+    let mut normalized = Vec::new();
+    for glob_pattern in globs {
+        let Some(normalized_pattern) = normalize_function_path(glob_pattern) else {
+            return Err(AnalyzeError::InvalidGlobPattern {
+                pattern: glob_pattern.clone(),
+            });
+        };
+        normalized.push(normalized_pattern);
+    }
+
+    Ok(normalized)
+}
+
+fn build_target_matchers(
+    targets: &[String],
+    target_mode: TargetInputMode,
+) -> Result<Vec<TargetMatcher>, AnalyzeError> {
+    let mut matchers = Vec::new();
+
+    for target in targets {
+        let pattern_input = match target_mode {
+            TargetInputMode::Exact => Pattern::escape(target),
+            TargetInputMode::Glob => target.clone(),
+        };
+
+        let pattern =
+            Pattern::new(&pattern_input).map_err(|source| AnalyzeError::ParseGlobPattern {
+                pattern: target.clone(),
+                source,
+            })?;
+
+        matchers.push(TargetMatcher {
+            target: target.clone(),
+            pattern,
+        });
+    }
+
+    Ok(matchers)
 }
 
 fn default_advisory_db_path() -> Result<PathBuf, AnalyzeError> {
@@ -410,8 +510,7 @@ fn extract_target_functions_from_advisory_db(
 
 fn analyze_source_file(
     source_file: &Path,
-    vulnerable_functions: &BTreeSet<String>,
-    method_targets_by_name: &BTreeMap<String, Vec<MethodTarget>>,
+    target_matchers: &[TargetMatcher],
     public_aliases: &BTreeMap<String, String>,
 ) -> Result<Vec<Finding>, AnalyzeError> {
     let source =
@@ -434,8 +533,7 @@ fn analyze_source_file(
 
     let mut detector = Detector::new(
         source_file.to_path_buf(),
-        vulnerable_functions.clone(),
-        method_targets_by_name.clone(),
+        target_matchers.to_vec(),
         merged_alias_map,
         imported_paths,
     );
@@ -619,41 +717,6 @@ fn extract_target_functions(report: &OsvReport) -> Vec<String> {
     targets.into_iter().collect()
 }
 
-fn build_method_targets(
-    vulnerable_functions: &BTreeSet<String>,
-) -> BTreeMap<String, Vec<MethodTarget>> {
-    let mut method_targets_by_name = BTreeMap::<String, Vec<MethodTarget>>::new();
-
-    for vulnerable_function in vulnerable_functions {
-        let segments: Vec<&str> = vulnerable_function.split("::").collect();
-        if segments.len() < 3 {
-            continue;
-        }
-
-        let type_segment = segments[segments.len() - 2];
-        if !looks_like_type_segment(type_segment) {
-            continue;
-        }
-
-        let method_name = segments[segments.len() - 1].to_owned();
-        let type_path = segments[..segments.len() - 1].join("::");
-
-        method_targets_by_name
-            .entry(method_name)
-            .or_default()
-            .push(MethodTarget {
-                vulnerable_function: vulnerable_function.clone(),
-                type_path,
-            });
-    }
-
-    for targets in method_targets_by_name.values_mut() {
-        targets.sort_by(|left, right| left.vulnerable_function.cmp(&right.vulnerable_function));
-    }
-
-    method_targets_by_name
-}
-
 fn collect_use_tree(
     prefix: &mut Vec<String>,
     tree: &UseTree,
@@ -752,13 +815,6 @@ fn normalize_function_path(path: &str) -> Option<String> {
     }
 
     Some(trimmed.to_owned())
-}
-
-fn looks_like_type_segment(segment: &str) -> bool {
-    segment
-        .chars()
-        .next()
-        .is_some_and(|first| first == '<' || first.is_uppercase())
 }
 
 fn simple_receiver_name(expr: &Expr) -> String {

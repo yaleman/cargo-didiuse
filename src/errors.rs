@@ -20,6 +20,19 @@ pub enum AnalyzeError {
         source: serde_json::Error,
     },
 
+    #[error("at least one glob pattern must be provided")]
+    MissingGlobPatterns,
+
+    #[error("glob pattern is empty: {pattern:?}")]
+    InvalidGlobPattern { pattern: String },
+
+    #[error("failed to parse glob pattern {pattern}: {source}")]
+    ParseGlobPattern {
+        pattern: String,
+        #[source]
+        source: glob::PatternError,
+    },
+
     #[error("failed to locate Cargo home directory: {source}")]
     LocateCargoHome {
         #[source]

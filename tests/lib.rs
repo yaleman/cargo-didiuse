@@ -1,4 +1,7 @@
-use cargo_didiuse::{MatchKind, analyze_advisory_db_against_crate, analyze_report_against_crate};
+use cargo_didiuse::{
+    MatchKind, analyze_advisory_db_against_crate, analyze_globs_against_crate,
+    analyze_report_against_crate, errors::AnalyzeError,
+};
 use serde_json::json;
 use std::{
     fs,
@@ -294,6 +297,158 @@ pub fn run() {
     assert!(result.target_functions.is_empty());
     assert!(!result.vulnerable_used);
     assert!(result.findings.is_empty());
+}
+
+#[test]
+fn glob_mode_detects_exact_direct_and_alias_calls() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(
+        &crate_root,
+        r#"
+use vulnerablepackage::ExampleStruct;
+
+pub fn run() {
+    vulnerablepackage::ExampleStruct::broken();
+    ExampleStruct::broken();
+}
+"#,
+    );
+
+    let result = analyze_globs_against_crate(
+        &["vulnerablepackage::ExampleStruct::broken".to_owned()],
+        &crate_root,
+    )
+    .expect("glob-mode analysis should succeed");
+
+    assert_eq!(
+        result.target_functions,
+        vec!["vulnerablepackage::ExampleStruct::broken"]
+    );
+    assert_eq!(result.findings.len(), 2);
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|finding| finding.match_kind == MatchKind::DirectPathCall)
+    );
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|finding| finding.match_kind == MatchKind::AliasResolvedCall)
+    );
+}
+
+#[test]
+fn glob_mode_supports_wildcard_heuristic_method_calls() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(
+        &crate_root,
+        r#"
+use vulnerablepackage::ExampleStruct;
+
+pub fn run(item: ExampleStruct) {
+    item.completely_different();
+}
+"#,
+    );
+
+    let result = analyze_globs_against_crate(
+        &["vulnerablepackage::ExampleStruct::*".to_owned()],
+        &crate_root,
+    )
+    .expect("glob-mode analysis should succeed for wildcard method pattern");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(
+        result.findings[0].match_kind,
+        MatchKind::HeuristicMethodCall
+    );
+    assert_eq!(
+        result.findings[0].vulnerable_function,
+        "vulnerablepackage::ExampleStruct::*"
+    );
+}
+
+#[test]
+fn glob_mode_supports_package_level_glob() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(
+        &crate_root,
+        r#"
+pub fn run() {
+    vulnerablepackage::AnyType::any_call();
+}
+"#,
+    );
+
+    let result = analyze_globs_against_crate(&["vulnerablepackage::*".to_owned()], &crate_root)
+        .expect("glob-mode analysis should succeed for package glob");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(
+        result.findings[0].vulnerable_function,
+        "vulnerablepackage::*"
+    );
+}
+
+#[test]
+fn glob_mode_overlap_uses_first_matching_pattern_once() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(
+        &crate_root,
+        r#"
+pub fn run() {
+    vulnerablepackage::ExampleStruct::broken();
+}
+"#,
+    );
+
+    let result = analyze_globs_against_crate(
+        &[
+            "vulnerablepackage::*".to_owned(),
+            "vulnerablepackage::ExampleStruct::*".to_owned(),
+        ],
+        &crate_root,
+    )
+    .expect("glob-mode analysis should succeed for overlapping patterns");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(
+        result.findings[0].vulnerable_function,
+        "vulnerablepackage::*"
+    );
+}
+
+#[test]
+fn glob_mode_rejects_invalid_patterns() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(&crate_root, "pub fn run() {}");
+
+    let error = analyze_globs_against_crate(&["vulnerablepackage::[".to_owned()], &crate_root)
+        .expect_err("invalid glob should fail analysis");
+
+    assert!(matches!(error, AnalyzeError::ParseGlobPattern { .. }));
+}
+
+#[test]
+fn glob_mode_rejects_empty_patterns() {
+    let temp_dir = TempDir::new().expect("failed to create temporary test directory");
+    let crate_root = temp_dir.path().join("consumer");
+    create_minimal_crate(&crate_root, "pub fn run() {}");
+
+    let error = analyze_globs_against_crate(&["   ".to_owned()], &crate_root)
+        .expect_err("empty glob should fail analysis");
+    assert!(matches!(error, AnalyzeError::InvalidGlobPattern { .. }));
+
+    let error = analyze_globs_against_crate(&[], &crate_root)
+        .expect_err("missing globs should fail analysis");
+    assert!(matches!(error, AnalyzeError::MissingGlobPatterns));
 }
 
 fn create_minimal_crate(crate_root: &Path, source: &str) {
